@@ -1,9 +1,10 @@
+use crate::image_proc::PixelFormat;
+use parking_lot::Mutex;
 use pipewire as pw;
 use pw::spa;
 use spa::pod::Pod;
-use parking_lot::Mutex;
-use std::sync::Arc;
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::thread;
 
 unsafe extern "C" {
@@ -15,6 +16,7 @@ pub struct FrameData {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
+    pub format: PixelFormat,
     pub data: Vec<u8>,
 }
 
@@ -63,6 +65,20 @@ struct StreamData {
 
 static FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NONE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn pixel_format(format: spa::param::video::VideoFormat) -> Option<PixelFormat> {
+    if format == spa::param::video::VideoFormat::RGBx {
+        Some(PixelFormat::Rgbx)
+    } else if format == spa::param::video::VideoFormat::BGRx {
+        Some(PixelFormat::Bgrx)
+    } else if format == spa::param::video::VideoFormat::RGBA {
+        Some(PixelFormat::Rgba)
+    } else if format == spa::param::video::VideoFormat::BGRA {
+        Some(PixelFormat::Bgra)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ParamBuffers(u32);
@@ -226,6 +242,21 @@ pub fn start_capture(
                         return;
                     }
 
+                    let negotiated_format = data.format.format();
+                    if pixel_format(negotiated_format).is_none() {
+                        eprintln!(
+                            "[screenshare-hook] unsupported negotiated video format: {:?}",
+                            negotiated_format
+                        );
+                        return;
+                    }
+
+                    let size = data.format.size();
+                    eprintln!(
+                        "[screenshare-hook] negotiated PipeWire format: {:?} {}x{}",
+                        negotiated_format, size.width, size.height
+                    );
+
                     // Complete buffer negotiation
                     let Ok(values) = build_buffers_param(&data.format) else {
                         return;
@@ -253,38 +284,96 @@ pub fn start_capture(
                     let chunk = d.chunk();
                     let chunk_size = chunk.size() as usize;
                     let chunk_offset = chunk.offset() as usize;
-                    let chunk_stride = chunk.stride() as u32;
+                    let chunk_stride = chunk.stride();
 
                     match d.data() {
                         Some(bytes) => {
                             let start = chunk_offset.min(bytes.len());
-                            let end = (chunk_offset + chunk_size).min(bytes.len());
+                            let end = chunk_offset.saturating_add(chunk_size).min(bytes.len());
                             let frame_bytes = &bytes[start..end];
 
                             let size = data.format.size();
-                            let stride = if chunk_stride == 0 { size.width * 4 } else { chunk_stride };
+                            let Some(row_bytes) = (size.width as usize).checked_mul(4) else {
+                                return;
+                            };
+                            let stride = if chunk_stride == 0 {
+                                row_bytes
+                            } else {
+                                let Ok(stride) = usize::try_from(chunk_stride) else {
+                                    eprintln!(
+                                        "[screenshare-hook] unsupported negative PipeWire stride: {}",
+                                        chunk_stride
+                                    );
+                                    return;
+                                };
+                                stride
+                            };
+                            if stride < row_bytes {
+                                eprintln!(
+                                    "[screenshare-hook] PipeWire stride {} is smaller than row size {}",
+                                    stride, row_bytes
+                                );
+                                return;
+                            }
 
-                            let count = FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            let Some(packed_len) = row_bytes.checked_mul(size.height as usize) else {
+                                return;
+                            };
+                            let required_len = if size.height == 0 {
+                                0
+                            } else {
+                                let Some(last_row) =
+                                    stride.checked_mul(size.height as usize - 1)
+                                else {
+                                    return;
+                                };
+                                let Some(required) = last_row.checked_add(row_bytes) else {
+                                    return;
+                                };
+                                required
+                            };
+                            if frame_bytes.len() < required_len {
+                                eprintln!(
+                                    "[screenshare-hook] short PipeWire frame: got {}, need {}",
+                                    frame_bytes.len(), required_len
+                                );
+                                return;
+                            }
+
+                            let Some(format) = pixel_format(data.format.format()) else {
+                                return;
+                            };
+
+                            let count = FRAME_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                + 1;
                             if count == 1 || count % 200 == 0 {
-                                eprintln!("[screenshare-hook] pw process: frame #{} size={}x{} stride={}", count, size.width, size.height, stride);
+                                eprintln!(
+                                    "[screenshare-hook] pw process: frame #{} size={}x{} stride={} format={:?}",
+                                    count, size.width, size.height, stride, format
+                                );
                             }
 
                             let mut guard = data.latest_frame.lock();
-                            if let Some(ref mut existing) = *guard {
-                                existing.width = size.width;
-                                existing.height = size.height;
-                                existing.stride = stride;
-                                if existing.data.len() != frame_bytes.len() {
-                                    existing.data.resize(frame_bytes.len(), 0);
-                                }
-                                existing.data.copy_from_slice(frame_bytes);
-                            } else {
-                                *guard = Some(FrameData {
-                                    width: size.width,
-                                    height: size.height,
-                                    stride,
-                                    data: frame_bytes.to_vec(),
-                                });
+                            let frame = guard.get_or_insert_with(|| FrameData {
+                                width: size.width,
+                                height: size.height,
+                                stride: row_bytes as u32,
+                                format,
+                                data: vec![0; packed_len],
+                            });
+                            frame.width = size.width;
+                            frame.height = size.height;
+                            frame.stride = row_bytes as u32;
+                            frame.format = format;
+                            if frame.data.len() != packed_len {
+                                frame.data.resize(packed_len, 0);
+                            }
+                            for row in 0..size.height as usize {
+                                let src_start = row * stride;
+                                let dst_start = row * row_bytes;
+                                frame.data[dst_start..dst_start + row_bytes]
+                                    .copy_from_slice(&frame_bytes[src_start..src_start + row_bytes]);
                             }
                         }
                         None => {
@@ -297,7 +386,7 @@ pub fn start_capture(
                 })
                 .register().map_err(|e| e.to_string())?;
 
-            // Advertise accepted video formats (restrict to RGBx / RGBA for color swap)
+            // Advertise the packed 32-bit formats handled by image_proc.
             let obj = spa::pod::object!(
                 spa::utils::SpaTypes::ObjectParamFormat,
                 spa::param::ParamType::EnumFormat,
