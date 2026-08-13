@@ -2,17 +2,35 @@ use resize::Pixel::RGBA8;
 use resize::Type::Triangle;
 use rgb::FromSlice;
 
-/// Resizes a 32-bit pixel buffer (RGBA/BGRA) from `(src_w, src_h)` to `(dst_w, dst_h)`,
-/// and swaps the Red and Blue channels (RGBA <-> BGRA).
+/// Byte layout of a packed, four-byte RGB pixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    Rgbx,
+    Bgrx,
+    Rgba,
+    Bgra,
+}
+
+impl PixelFormat {
+    fn is_bgr(self) -> bool {
+        matches!(self, Self::Bgrx | Self::Bgra)
+    }
+}
+
+/// Resizes a tightly packed 32-bit pixel buffer and converts its channel order.
+///
+/// The fourth byte (alpha or padding) is preserved. PipeWire row padding must be
+/// removed before calling this function; `src` and `dst` are both tightly packed.
 pub fn resize_and_convert(
     src: &[u8],
     src_w: u32,
     src_h: u32,
+    src_format: PixelFormat,
     dst: &mut [u8],
     dst_w: u32,
     dst_h: u32,
+    dst_format: PixelFormat,
 ) -> Result<(), &'static str> {
-    // 1. Validation
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return Err("Dimensions cannot be zero");
     }
@@ -34,17 +52,11 @@ pub fn resize_and_convert(
         return Err("Destination buffer size does not match dimensions");
     }
 
-    // 2. Perform resizing and channel swapping
     if src_w == dst_w && src_h == dst_h {
-        // Fast path: dimensions are identical, just copy and swap channels in one pass
-        for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-            d[0] = s[2];
-            d[1] = s[1];
-            d[2] = s[0];
-            d[3] = s[3];
-        }
+        dst.copy_from_slice(src);
     } else {
-        // Slow path: resize first, then swap channels in-place in dst
+        // The resizer treats all four bytes independently, so it is safe to use
+        // RGBA8 for BGRx/BGRA data and fix the channel order afterwards.
         let src_rgba = src.as_rgba();
         let dst_rgba = dst.as_rgba_mut();
 
@@ -55,18 +67,19 @@ pub fn resize_and_convert(
             dst_h as usize,
             RGBA8,
             Triangle,
-        ).map_err(|_| "Failed to initialize resizer")?;
+        )
+        .map_err(|_| "Failed to initialize resizer")?;
 
         resizer
             .resize(src_rgba, dst_rgba)
             .map_err(|_| "Resizing failed")?;
+    }
 
-        // Swap Red and Blue channels (0 and 2) in-place efficiently
+    // BGRx/BGRA and RGBx/RGBA differ only in the red/blue byte positions.
+    // Do not swap when PipeWire and XImage already use the same order.
+    if src_format.is_bgr() != dst_format.is_bgr() {
         for pixel in dst.chunks_exact_mut(4) {
-            let r = pixel[0];
-            let b = pixel[2];
-            pixel[0] = b;
-            pixel[2] = r;
+            pixel.swap(0, 2);
         }
     }
 
@@ -78,63 +91,108 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_identical_size_swap() {
-        // A 2x2 image where each pixel is [R, G, B, A]
-        // Pixel 0: [255, 0, 0, 255] (Red)
-        // Pixel 1: [0, 255, 0, 255] (Green)
-        // Pixel 2: [0, 0, 255, 255] (Blue)
-        // Pixel 3: [10, 20, 30, 40]
-        let src = vec![
-            255, 0, 0, 255,
-            0, 255, 0, 255,
-            0, 0, 255, 255,
-            10, 20, 30, 40,
-        ];
-        let mut dst = vec![0u8; 16];
+    fn bgr_to_bgr_does_not_swap_channels() {
+        let src = vec![255, 10, 20, 0, 30, 40, 50, 255];
+        let mut dst = vec![0u8; src.len()];
 
-        let res = resize_and_convert(&src, 2, 2, &mut dst, 2, 2);
-        assert!(res.is_ok());
+        resize_and_convert(
+            &src,
+            2,
+            1,
+            PixelFormat::Bgrx,
+            &mut dst,
+            2,
+            1,
+            PixelFormat::Bgrx,
+        )
+        .unwrap();
 
-        // Expected output is swapped R and B:
-        // Pixel 0: [0, 0, 255, 255] (Blue)
-        // Pixel 1: [0, 255, 0, 255] (Green)
-        // Pixel 2: [255, 0, 0, 255] (Red)
-        // Pixel 3: [30, 20, 10, 40]
-        let expected = vec![
-            0, 0, 255, 255,
-            0, 255, 0, 255,
-            255, 0, 0, 255,
-            30, 20, 10, 40,
-        ];
-        assert_eq!(dst, expected);
+        assert_eq!(dst, src);
     }
 
     #[test]
-    fn test_downscale_and_swap() {
-        // A 4x4 image with constant solid red [255, 0, 0, 255]
+    fn rgb_to_bgr_swaps_red_and_blue() {
+        let src = vec![255, 0, 0, 255, 0, 0, 255, 10];
+        let mut dst = vec![0u8; src.len()];
+
+        resize_and_convert(
+            &src,
+            2,
+            1,
+            PixelFormat::Rgba,
+            &mut dst,
+            2,
+            1,
+            PixelFormat::Bgrx,
+        )
+        .unwrap();
+
+        assert_eq!(dst, vec![0, 0, 255, 255, 255, 0, 0, 10]);
+    }
+
+    #[test]
+    fn downscale_and_convert_channel_order() {
         let src = vec![255, 0, 0, 255].repeat(16);
-        let mut dst = vec![0u8; 4]; // 1x1 destination
+        let mut dst = vec![0u8; 4];
 
-        let res = resize_and_convert(&src, 4, 4, &mut dst, 1, 1);
-        assert!(res.is_ok());
+        resize_and_convert(
+            &src,
+            4,
+            4,
+            PixelFormat::Rgbx,
+            &mut dst,
+            1,
+            1,
+            PixelFormat::Bgra,
+        )
+        .unwrap();
 
-        // Since it's solid red, after swap it should be solid blue [0, 0, 255, 255]
         assert_eq!(dst, vec![0, 0, 255, 255]);
     }
 
     #[test]
-    fn test_validation() {
+    fn validates_dimensions_and_buffer_sizes() {
         let src = vec![0u8; 16];
         let mut dst = vec![0u8; 16];
 
-        // Invalid dimensions (zero)
-        assert!(resize_and_convert(&src, 0, 2, &mut dst, 2, 2).is_err());
-        assert!(resize_and_convert(&src, 2, 2, &mut dst, 2, 0).is_err());
-
-        // Source buffer size mismatch
-        assert!(resize_and_convert(&src[..12], 2, 2, &mut dst, 2, 2).is_err());
-
-        // Destination buffer size mismatch
-        assert!(resize_and_convert(&src, 2, 2, &mut dst[..12], 2, 2).is_err());
+        assert!(
+            resize_and_convert(
+                &src,
+                0,
+                2,
+                PixelFormat::Bgrx,
+                &mut dst,
+                2,
+                2,
+                PixelFormat::Bgrx,
+            )
+            .is_err()
+        );
+        assert!(
+            resize_and_convert(
+                &src[..12],
+                2,
+                2,
+                PixelFormat::Bgrx,
+                &mut dst,
+                2,
+                2,
+                PixelFormat::Bgrx,
+            )
+            .is_err()
+        );
+        assert!(
+            resize_and_convert(
+                &src,
+                2,
+                2,
+                PixelFormat::Bgrx,
+                &mut dst[..12],
+                2,
+                2,
+                PixelFormat::Bgrx,
+            )
+            .is_err()
+        );
     }
 }

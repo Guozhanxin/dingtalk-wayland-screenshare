@@ -35,6 +35,110 @@ static G_CAPTURE_XIMAGE: AtomicPtr<x11::xlib::XImage> = AtomicPtr::new(std::ptr:
 static G_INJECTOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static G_XSHM_ATTACH_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone, Copy)]
+struct XImageTarget {
+    width: u32,
+    height: u32,
+    bytes_per_line: usize,
+    format: image_proc::PixelFormat,
+    data: *mut u8,
+}
+
+unsafe fn inspect_ximage(image: *mut x11::xlib::XImage) -> Result<XImageTarget, &'static str> {
+    if image.is_null() {
+        return Err("XImage is null");
+    }
+
+    let image = &*image;
+    if image.data.is_null() {
+        return Err("XImage data is null");
+    }
+    if image.format != x11::xlib::ZPixmap {
+        return Err("Only ZPixmap XImages are supported");
+    }
+    if image.width <= 0 || image.height <= 0 || image.bits_per_pixel != 32 {
+        return Err("Only non-empty 32-bit XImages are supported");
+    }
+    if image.byte_order != x11::xlib::LSBFirst {
+        return Err("Only LSB-first XImages are supported");
+    }
+
+    let format = if image.red_mask == 0xff0000
+        && image.green_mask == 0xff00
+        && image.blue_mask == 0xff
+    {
+        // A 0x00RRGGBB pixel is stored as B, G, R, X on little-endian hosts.
+        image_proc::PixelFormat::Bgrx
+    } else if image.red_mask == 0xff && image.green_mask == 0xff00 && image.blue_mask == 0xff0000 {
+        image_proc::PixelFormat::Rgbx
+    } else {
+        return Err("Unsupported XImage RGB masks");
+    };
+
+    let width = image.width as u32;
+    let height = image.height as u32;
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .ok_or("Overflow calculating XImage row size")?;
+    let bytes_per_line =
+        usize::try_from(image.bytes_per_line).map_err(|_| "XImage has a negative row stride")?;
+    if bytes_per_line < row_bytes {
+        return Err("XImage row stride is smaller than its width");
+    }
+    bytes_per_line
+        .checked_mul(height as usize)
+        .ok_or("Overflow calculating XImage buffer size")?;
+
+    Ok(XImageTarget {
+        width,
+        height,
+        bytes_per_line,
+        format,
+        data: image.data as *mut u8,
+    })
+}
+
+unsafe fn copy_packed_to_ximage(src: &[u8], target: XImageTarget) {
+    let row_bytes = target.width as usize * 4;
+    if target.bytes_per_line == row_bytes {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), target.data, src.len());
+        return;
+    }
+
+    for row in 0..target.height as usize {
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr().add(row * row_bytes),
+            target.data.add(row * target.bytes_per_line),
+            row_bytes,
+        );
+    }
+}
+
+unsafe fn inject_frame_once(
+    frame: &pw::FrameData,
+    image: *mut x11::xlib::XImage,
+) -> Result<(), &'static str> {
+    let target = inspect_ximage(image)?;
+    let buffer_len = (target.width as usize)
+        .checked_mul(target.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or("Overflow calculating staging buffer size")?;
+    let mut staging_buffer = vec![0u8; buffer_len];
+
+    image_proc::resize_and_convert(
+        &frame.data,
+        frame.width,
+        frame.height,
+        frame.format,
+        &mut staging_buffer,
+        target.width,
+        target.height,
+        target.format,
+    )?;
+    copy_packed_to_ximage(&staging_buffer, target);
+    Ok(())
+}
+
 unsafe fn is_caller_from_meeting_sdk() -> bool {
     let mut callstack: [*mut libc::c_void; 4] = [std::ptr::null_mut(); 4];
     let frames = libc::backtrace(callstack.as_mut_ptr(), 4);
@@ -157,15 +261,23 @@ fn injector_loop(latest_frame: std::sync::Arc<Mutex<Option<pw::FrameData>>>) {
         return;
     }
     
-    let (width, height, bytes_per_line, ximage_data) = unsafe {
-        let img = &*ximage;
-        (img.width, img.height, img.bytes_per_line as usize, img.data as *mut u8)
+    let target = unsafe {
+        match inspect_ximage(ximage) {
+            Ok(target) => target,
+            Err(e) => {
+                eprintln!("[screenshare-hook] cannot inject into XImage: {}", e);
+                return;
+            }
+        }
     };
-    
-    let buf_size = bytes_per_line * (height as usize);
+
+    let buf_size = target.width as usize * target.height as usize * 4;
     let mut staging_buffer = vec![0u8; buf_size];
     
-    eprintln!("[screenshare-hook] injector locked XImage: {}x{} data={:?}", width, height, ximage_data);
+    eprintln!(
+        "[screenshare-hook] injector locked XImage: {}x{} stride={} format={:?} data={:?}",
+        target.width, target.height, target.bytes_per_line, target.format, target.data
+    );
     
     while G_INJECTOR_RUNNING.load(Ordering::Acquire) {
         let mut frame_copied = false;
@@ -176,9 +288,11 @@ fn injector_loop(latest_frame: std::sync::Arc<Mutex<Option<pw::FrameData>>>) {
                     &frame.data,
                     frame.width,
                     frame.height,
+                    frame.format,
                     &mut staging_buffer,
-                    width as u32,
-                    height as u32,
+                    target.width,
+                    target.height,
+                    target.format,
                 ) {
                     eprintln!("[screenshare-hook] resize_and_convert failed in injector: {}", e);
                 } else {
@@ -190,7 +304,7 @@ fn injector_loop(latest_frame: std::sync::Arc<Mutex<Option<pw::FrameData>>>) {
         
         if frame_copied && G_INJECTOR_RUNNING.load(Ordering::Acquire) {
             unsafe {
-                std::ptr::copy_nonoverlapping(staging_buffer.as_ptr(), ximage_data, buf_size);
+                copy_packed_to_ximage(&staging_buffer, target);
             }
             inject_count += 1;
             if inject_count == 1 || inject_count % 200 == 0 {
@@ -406,19 +520,9 @@ pub unsafe extern "C" fn XShmGetImage(
 
         if let Some(cap) = &guard.capture {
             if let Some(frame) = cap.get_latest_frame() {
-                let dst_slice = std::slice::from_raw_parts_mut(
-                    (*image).data as *mut u8,
-                    ((*image).width as usize) * ((*image).height as usize) * 4,
-                );
-
-                let _ = image_proc::resize_and_convert(
-                    &frame.data,
-                    frame.width,
-                    frame.height,
-                    dst_slice,
-                    (*image).width as u32,
-                    (*image).height as u32,
-                );
+                if let Err(e) = inject_frame_once(&frame, image) {
+                    eprintln!("[screenshare-hook] one-shot XShm injection failed: {}", e);
+                }
             }
         }
     }
@@ -469,19 +573,9 @@ pub unsafe extern "C" fn XGetImage(
 
         if let Some(cap) = &guard.capture {
             if let Some(frame) = cap.get_latest_frame() {
-                let dst_slice = std::slice::from_raw_parts_mut(
-                    (*image).data as *mut u8,
-                    (width as usize) * (height as usize) * 4,
-                );
-
-                let _ = image_proc::resize_and_convert(
-                    &frame.data,
-                    frame.width,
-                    frame.height,
-                    dst_slice,
-                    width,
-                    height,
-                );
+                if let Err(e) = inject_frame_once(&frame, image) {
+                    eprintln!("[screenshare-hook] one-shot XGetImage injection failed: {}", e);
+                }
             }
         }
     }
@@ -513,4 +607,3 @@ pub unsafe extern "C" fn shmdt(shmaddr: *const libc::c_void) -> c_int {
         -1
     }
 }
-
