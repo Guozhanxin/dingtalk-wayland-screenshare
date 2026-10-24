@@ -34,21 +34,68 @@ paru -S dingtalk-wayland-screenshare-rust-git
 
 ## 🛠️ 编译与手动安装
 
-确保您的系统已安装 `rust`、`cargo` 以及 `pipewire` 开发库：
+编译产物为 `target/release/libdingtalk_wayland_screenshare.so`。运行时需要 PipeWire 和可用的 XDG Desktop Portal 后端。
+
+### Fedora
+
+安装系统构建依赖。`clang-devel` 提供 `libclang.so`，`libspa-sys` 的 `bindgen` 在构建时需要它：
 
 ```bash
-cargo build --release
+sudo dnf install pipewire-devel libX11-devel libXext-devel clang-devel pkgconf-pkg-config
 ```
 
-编译产物位于 `target/release/libdingtalk_wayland_screenshare.so`。
+可用 [mise](https://mise.jdx.dev/) 安装并使用 Rust 工具链：
 
-## 🚀 使用与测试
+```bash
+mise install rust@stable
+cd /path/to/dingtalk-wayland-screenshare
+mise exec rust@stable -- cargo build --release
+```
 
-通过 `LD_PRELOAD` 预加载启动钉钉：
+若 `bindgen` 仍找不到 `libclang.so`，请确认 `clang-devel` 已安装，并显式设置库路径：
+
+```bash
+export LIBCLANG_PATH=/usr/lib64
+mise exec rust@stable -- cargo build --release
+```
+
+### 原生安装的钉钉
+
+对于能从终端以 `dingtalk` 启动的原生安装版，可直接预加载编译后的库：
 
 ```bash
 LD_PRELOAD=/path/to/libdingtalk_wayland_screenshare.so dingtalk
 ```
+
+Arch 的安装脚本将库安装为 `/usr/lib/dingtalk/libdingtalk_hook.so`，并使用仓库中的 `dingtalk-wayland-screenshare` 启动器。
+
+### Fedora Flatpak 版钉钉
+
+Fedora 上的 Flatpak 应用 ID 为 `com.dingtalk.DingTalk`。Flatpak 沙箱默认无法读取宿主机中的 Hook 库，因此先为该应用添加持久化覆盖配置。将以下路径替换为本仓库的实际绝对路径：
+
+```bash
+flatpak override --user \
+  --filesystem=/path/to/dingtalk-wayland-screenshare:ro \
+  --socket=wayland \
+  --env=QT_QPA_PLATFORM=wayland \
+  --env=QT_AUTO_SCREEN_SCALE_FACTOR=1 \
+  --env=LD_PRELOAD=/path/to/dingtalk-wayland-screenshare/target/release/libdingtalk_wayland_screenshare.so \
+  com.dingtalk.DingTalk
+```
+
+测试启动：
+
+```bash
+flatpak run com.dingtalk.DingTalk
+```
+
+覆盖配置会保留在 Flatpak 用户配置中。完全退出已有的钉钉进程后，直接点击应用菜单中的钉钉图标即可自动应用 Hook，无需再从终端启动。撤销该配置：
+
+```bash
+flatpak override --user --reset com.dingtalk.DingTalk
+```
+
+进入会议并选择屏幕共享后，应由桌面环境的 Portal 弹出屏幕或窗口选择器。
 
 ## 💖 致谢与致敬
 
